@@ -148,7 +148,9 @@ def test_masked_adam_state(use_chain_flat: bool, inplace: bool) -> None:
     params = [torch.tensor([2.0]), torch.tensor([3.0])]
     inner = torchopt.transform.scale_by_adam.impl(already_flattened=use_chain_flat)
     optimizer = torchopt.transform.masked.impl(
-        inner, [True, False], already_flattened=use_chain_flat,
+        inner,
+        [True, False],
+        already_flattened=use_chain_flat,
     )
     state = optimizer.init(params)
     # Adam stores two moments and a counter for only the selected parameter.

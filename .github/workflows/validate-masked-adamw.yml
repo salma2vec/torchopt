@@ -35,6 +35,7 @@ jobs:
           python -m pip freeze > dependencies.txt
       - name: Baseline regression
         run: |
+          git fetch --depth=1 origin 960fb0aa53f27bad1af0bdf018b5ad4be077949a
           cp torchopt/transform/add_decayed_weights.py /tmp/add_decayed_weights.fixed.py
           git show 960fb0aa53f27bad1af0bdf018b5ad4be077949a:torchopt/transform/add_decayed_weights.py > torchopt/transform/add_decayed_weights.py
           set +e

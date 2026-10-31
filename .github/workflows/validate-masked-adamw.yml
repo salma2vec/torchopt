@@ -36,12 +36,15 @@ jobs:
       - name: Baseline regression
         run: |
           git fetch --depth=1 origin 960fb0aa53f27bad1af0bdf018b5ad4be077949a
+          cp torchopt/alias/adamw.py /tmp/adamw.fixed.py
           cp torchopt/transform/add_decayed_weights.py /tmp/add_decayed_weights.fixed.py
+          git show 960fb0aa53f27bad1af0bdf018b5ad4be077949a:torchopt/alias/adamw.py > torchopt/alias/adamw.py
           git show 960fb0aa53f27bad1af0bdf018b5ad4be077949a:torchopt/transform/add_decayed_weights.py > torchopt/transform/add_decayed_weights.py
           set +e
           PYTHONPATH=. python -m pytest tests/test_masked_adamw.py -q --junitxml=before.xml
           result=$?
           set -e
+          cp /tmp/adamw.fixed.py torchopt/alias/adamw.py
           cp /tmp/add_decayed_weights.fixed.py torchopt/transform/add_decayed_weights.py
           test "$result" -eq 1
           python - <<'PY'
@@ -52,19 +55,21 @@ jobs:
           assert int(suite.attrib['skipped']) == 0, suite.attrib
           print(suite.attrib)
           PY
+      - name: Patched regressions
+        run: PYTHONPATH=. python -m pytest tests/test_masked_adamw.py -q --junitxml=regression.xml
       - name: Native optimizer and transformation suites
         run: |
-          PYTHONPATH=. python -m pytest tests/test_masked_adamw.py tests/test_alias.py tests/test_transform.py tests/test_combine.py -q --junitxml=after.xml
+          PYTHONPATH=. python -m pytest tests/test_alias.py tests/test_transform.py tests/test_combine.py -q -W "ignore:We've integrated functorch into PyTorch:FutureWarning" --junitxml=after.xml
       - name: Changed-file style checks
         run: |
-          python -m ruff check torchopt/transform/add_decayed_weights.py tests/test_masked_adamw.py
-          python -m black --check torchopt/transform/add_decayed_weights.py tests/test_masked_adamw.py
-          python -m isort --check-only torchopt/transform/add_decayed_weights.py tests/test_masked_adamw.py
+          python -m ruff check torchopt/alias/adamw.py torchopt/transform/add_decayed_weights.py tests/test_masked_adamw.py
+          python -m black --check torchopt/alias/adamw.py torchopt/transform/add_decayed_weights.py tests/test_masked_adamw.py
+          python -m isort --check-only torchopt/alias/adamw.py torchopt/transform/add_decayed_weights.py tests/test_masked_adamw.py
       - name: Record exact sources
         if: always()
         run: |
           git rev-parse HEAD > revision.txt
-          sha256sum torchopt/transform/add_decayed_weights.py tests/test_masked_adamw.py > source.sha256
+          sha256sum torchopt/alias/adamw.py torchopt/transform/add_decayed_weights.py tests/test_masked_adamw.py > source.sha256
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -72,6 +77,7 @@ jobs:
           path: |
             before.xml
             after.xml
+            regression.xml
             dependencies.txt
             revision.txt
             source.sha256

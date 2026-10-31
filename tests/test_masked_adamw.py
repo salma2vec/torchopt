@@ -162,3 +162,69 @@ def test_masked_adam_state(use_chain_flat: bool, inplace: bool) -> None:
         assert updates[1] is passed_through
         torch.testing.assert_close(updates[0], torch.tensor([2.0 / (2.0 + 1e-8)]))
         assert len(pytree.tree_leaves(state)) == 3
+
+
+@pytest.mark.parametrize('callable_mask', [True, False])
+@pytest.mark.parametrize('inplace', [True, False])
+@pytest.mark.parametrize('mask_kind', ['full', 'prefix', 'all', 'none'])
+def test_adamw_mask_preserves_parameter_tree(
+    use_chain_flat: bool,
+    callable_mask: bool,
+    inplace: bool,
+    mask_kind: str,
+) -> None:
+    params = {
+        'layer': {
+            'weight': torch.tensor([[2.0, 3.0]]),
+            'bias': torch.tensor([4.0, 5.0]),
+        },
+        'head': [torch.tensor([6.0]), torch.tensor([7.0])],
+    }
+    if mask_kind == 'full':
+        mask = {'layer': {'weight': True, 'bias': False}, 'head': [False, False]}
+    elif mask_kind == 'prefix':
+        mask = {'layer': {'weight': True, 'bias': False}, 'head': False}
+    else:
+        mask = mask_kind == 'all'
+    if callable_mask:
+        original_mask = mask
+
+        def mask_fn(tree):
+            # A callable must see the original tree, including the nested list.
+            assert tree['layer']['weight'].ndim == 2
+            assert len(tree['head']) == 2
+            return original_mask
+
+        mask = mask_fn
+    expected = pytree.tree_map(torch.clone, params)
+    if mask_kind == 'all':
+        expected = pytree.tree_map(lambda p: p * (1 - 0.2 * 0.1), expected)
+    elif mask_kind != 'none':
+        expected['layer']['weight'] *= 1 - 0.2 * 0.1
+    optimizer = torchopt.adamw(lr=0.2, weight_decay=0.1, mask=mask)
+    state = optimizer.init(params)
+    updates, _ = optimizer.update(
+        pytree.tree_map(torch.zeros_like, params),
+        state,
+        params=params,
+        inplace=inplace,
+    )
+    result = torchopt.apply_updates(params, updates, inplace=inplace)
+    assert pytree.tree_structure(result) == pytree.tree_structure(expected)
+    for actual, target in zip(pytree.tree_leaves(result), pytree.tree_leaves(expected)):
+        torch.testing.assert_close(actual, target)
+
+
+@pytest.mark.parametrize('inplace', [True, False])
+def test_prefix_mask_excludes_optimizer_state(inplace: bool) -> None:
+    params = {'active': [torch.tensor([2.0])], 'frozen': {'bias': torch.tensor([3.0])}}
+    optimizer = torchopt.transform.masked(
+        torchopt.transform.scale_by_adam(),
+        {'active': True, 'frozen': False},
+    )
+    state = optimizer.init(params)
+    assert len(pytree.tree_leaves(state)) == 3
+    updates, state = optimizer.update(params, state, inplace=inplace)
+    assert updates['frozen'] is params['frozen']
+    assert len(pytree.tree_leaves(state)) == 3
+    torch.testing.assert_close(updates['active'][0], torch.tensor([2.0 / (2.0 + 1e-8)]))

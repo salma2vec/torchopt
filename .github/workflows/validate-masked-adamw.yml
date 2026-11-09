@@ -1,0 +1,147 @@
+name: Validate masked AdamW
+on:
+  push:
+    branches: [codex/validate-masked-adamw-20261109]
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - python: '3.10'
+            torch: '2.5.1'
+          - python: '3.11'
+            torch: '2.9.1'
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+      PYTEST_DISABLE_PLUGIN_AUTOLOAD: '1'
+      OMP_NUM_THREADS: '1'
+      MKL_NUM_THREADS: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install CPU runtime
+        run: |
+          python -m pip install torch==${{ matrix.torch }} --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install 'numpy==1.26.4' 'optree==0.17.0' graphviz typing-extensions 'pytest==8.4.2' 'jax[cpu]==0.4.35' 'jaxopt==0.8.3' 'optax==0.2.4' 'chex==0.1.88' 'scipy==1.14.1' 'ml-dtypes==0.5.4'
+          python -m pip freeze > dependencies.txt
+      - name: Set up pinned baseline
+        run: |
+          git fetch --depth=1 origin 960fb0aa53f27bad1af0bdf018b5ad4be077949a
+          git worktree add --detach /tmp/torchopt-baseline 960fb0aa53f27bad1af0bdf018b5ad4be077949a
+          cp tests/test_masked_adamw.py /tmp/torchopt-baseline/tests/
+      - name: Demonstrate baseline regressions
+        run: |
+          cd /tmp/torchopt-baseline
+          set +e
+          PYTHONPATH=. python -m pytest tests/test_masked_adamw.py -q --junitxml="$GITHUB_WORKSPACE/before.xml" > "$GITHUB_WORKSPACE/before.log" 2>&1
+          result=$?
+          set -e
+          tail -4 "$GITHUB_WORKSPACE/before.log"
+          test "$result" -eq 1
+          python - <<'PY'
+          import os
+          import xml.etree.ElementTree as ET
+          suite = ET.parse(os.environ['GITHUB_WORKSPACE'] + '/before.xml').getroot()[0]
+          assert int(suite.attrib['failures']) == 82, suite.attrib
+          assert int(suite.attrib['errors']) == int(suite.attrib['skipped']) == 0, suite.attrib
+          assert int(suite.attrib['tests']) == 98, suite.attrib
+          PY
+      - name: Patched regressions without global warning filters
+        run: PYTHONPATH=. python -m pytest tests/test_masked_adamw.py -q --junitxml=regression.xml
+      - name: Compare unfiltered native optimizer suites
+        run: |
+          set +e
+          (cd /tmp/torchopt-baseline && PYTHONPATH=. python -m pytest tests/test_alias.py tests/test_transform.py tests/test_combine.py -q --junitxml="$GITHUB_WORKSPACE/native-unfiltered-base.xml") > native-unfiltered-base.log 2>&1
+          base_result=$?
+          PYTHONPATH=. python -m pytest tests/test_alias.py tests/test_transform.py tests/test_combine.py -q --junitxml=native-unfiltered-candidate.xml > native-unfiltered-candidate.log 2>&1
+          candidate_result=$?
+          set -e
+          tail -3 native-unfiltered-base.log
+          tail -3 native-unfiltered-candidate.log
+          test "$base_result" -eq 1
+          test "$candidate_result" -eq 1
+          python - <<'PY'
+          import xml.etree.ElementTree as ET
+          def failures(path):
+              root = ET.parse(path).getroot()
+              assert not root.findall('.//error')
+              failed = {}
+              for case in root.findall('.//testcase'):
+                  failure = case.find('failure')
+                  if failure is not None:
+                      assert 'FutureWarning: We\'ve integrated functorch into PyTorch' in failure.attrib['message'], failure.attrib
+                      failed[(case.attrib['classname'], case.attrib['name'])] = failure.attrib['message']
+              return failed
+          before = failures('native-unfiltered-base.xml')
+          after = failures('native-unfiltered-candidate.xml')
+          assert before == after
+          print('Identical inherited functorch warning failures:', len(before))
+          PY
+      - name: Native optimizer suites with exact dependency warning filter
+        run: |
+          PYTHONPATH=. python -m pytest tests/test_alias.py tests/test_transform.py tests/test_combine.py -q -W "ignore:We've integrated functorch into PyTorch:FutureWarning" --junitxml=native.xml
+      - name: Full native suite comparison
+        run: |
+          set +e
+          (cd /tmp/torchopt-baseline && PYTHONPATH=. python -m pytest tests/ --ignore=tests/test_masked_adamw.py -q -W "ignore:We've integrated functorch into PyTorch:FutureWarning" --junitxml="$GITHUB_WORKSPACE/full-base.xml") > full-base.log 2>&1
+          base_result=$?
+          PYTHONPATH=. python -m pytest tests/ --ignore=tests/test_masked_adamw.py -q -W "ignore:We've integrated functorch into PyTorch:FutureWarning" --junitxml=full-candidate.xml > full-candidate.log 2>&1
+          candidate_result=$?
+          set -e
+          tail -6 full-base.log
+          tail -6 full-candidate.log
+          test "$base_result" -le 1
+          test "$candidate_result" -eq "$base_result"
+          python - <<'PY'
+          import xml.etree.ElementTree as ET
+          def outcome(path):
+              root = ET.parse(path).getroot()
+              assert not root.findall('.//error')
+              states = {}
+              for case in root.findall('.//testcase'):
+                  failure = case.find('failure')
+                  skipped = case.find('skipped')
+                  state = ('failed', failure.attrib['message']) if failure is not None else ('skipped' if skipped is not None else 'passed')
+                  states[(case.attrib['classname'], case.attrib['name'])] = state
+              print(path, root[0].attrib)
+              return states
+          assert outcome('full-base.xml') == outcome('full-candidate.xml')
+          PY
+      - name: Record exact sources
+        if: always()
+        run: |
+          git rev-parse HEAD > revision.txt
+          sha256sum torchopt/alias/adamw.py torchopt/transform/add_decayed_weights.py tests/test_masked_adamw.py > source.sha256
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: masked-adamw-${{ matrix.python }}-${{ matrix.torch }}
+          path: |
+            *.xml
+            *.log
+            dependencies.txt
+            revision.txt
+            source.sha256
+  style:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install lint runtime
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libenchant-2-2 hunspell-en-us
+          python -m pip install torch==2.5.1 --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install 'numpy==1.26.4' 'optree==0.17.0' graphviz typing-extensions 'pre-commit==3.8.0' 'pylint[spelling]==3.2.7'
+      - name: Repository pre-commit hooks
+        run: python -m pre_commit run --files CHANGELOG.md torchopt/alias/adamw.py torchopt/transform/add_decayed_weights.py tests/test_masked_adamw.py
